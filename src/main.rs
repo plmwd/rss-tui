@@ -1,80 +1,83 @@
+mod app;
+mod event;
+mod feed;
+
+use crate::app::App;
+use crate::event::Event;
+
 use crossterm::{
-    event::{self, read, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
+    event::{read, DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::{
-    fs::File,
-    io::{self, Read, Write},
-    thread,
-    time::Duration,
-};
+use event::{EventListener, Key};
+use std::sync::Arc;
+use std::{io, str};
+use tokio::sync::Mutex;
+
 use tui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Widget},
+    text::Text,
+    widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
+use tui::{
+    layout::{Constraint, Direction, Layout},
+    widgets::ListState,
+};
 
-fn read_feeds(feeds: &mut Vec<String>) {
-    feeds.clear();
-    let mut feeds_str = String::new();
-    if let Ok(mut feeds_file) = File::open("feeds.txt") {
-        feeds_file.read_to_string(&mut feeds_str).unwrap();
-        feeds.extend(feeds_str.lines().filter_map(|f| {
-            if f.is_empty() {
-                None
-            } else {
-                Some(String::from(f.trim()))
-            }
-        }))
-    }
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app = Arc::new(Mutex::new(App::new()));
+    start_ui(&app).await?;
+    Ok(())
 }
 
-fn write_feeds(feeds: &[String]) {
-    if let Ok(mut feeds_file) = File::create("feeds.txt") {
-        for f in feeds.iter() {
-            _ = feeds_file.write(f.as_bytes()).unwrap();
-            _ = feeds_file.write("\n".as_bytes())
-        }
-    }
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // setup terminal
+async fn start_ui(app: &Arc<Mutex<App>>) -> Result<(), Box<dyn std::error::Error>> {
+    // setup termina
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut feeds: Vec<String> = vec![];
-    read_feeds(&mut feeds);
 
     let mut list_state = ListState::default();
     list_state.select(Some(0));
 
+    let events = EventListener::new(17);
+
     loop {
+        let mut app = app.lock().await;
         terminal.draw(|f| {
-            let size = f.size();
-            // NOTE: why does this need as_ref()?
-            let items: Vec<ListItem> = feeds.iter().map(|f| ListItem::new(f.as_ref())).collect();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Percentage(100)])
+                .split(f.size());
+
+            let items: Vec<ListItem> = app
+                .feeds
+                .iter()
+                .map(|f| ListItem::new(f.url.as_ref()))
+                .collect();
+
             let list = List::new(items)
                 .block(Block::default().title("List").borders(Borders::ALL))
                 .style(Style::default().fg(Color::White))
                 .highlight_style(Style::default().add_modifier(Modifier::BOLD))
                 .highlight_symbol(">>");
-            f.render_stateful_widget(list, size, &mut list_state);
+
+            let ticks = Paragraph::new(Text::from(app.tick_count.to_string()));
+
+            f.render_widget(ticks, chunks[0]);
+            f.render_stateful_widget(list, chunks[1], &mut list_state);
         })?;
 
-        match read()? {
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('j'),
-                ..
-            }) => {
+        match events.next()? {
+            Event::Input(Key::Char('j')) => {
                 let i = match list_state.selected() {
                     Some(i) => {
-                        if i >= feeds.len() - 1 {
+                        if i >= app.feeds.len() - 1 {
                             0
                         } else {
                             i + 1
@@ -84,14 +87,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 list_state.select(Some(i));
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('k'),
-                ..
-            }) => {
+            Event::Input(Key::Char('k')) => {
                 let i = match list_state.selected() {
                     Some(i) => {
                         if i == 0 {
-                            feeds.len() - 1
+                            app.feeds.len() - 1
                         } else {
                             i - 1
                         }
@@ -100,34 +100,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 list_state.select(Some(i));
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('r'),
-                ..
-            }) => {
-                read_feeds(&mut feeds);
+            Event::Input(Key::Char('r')) => {
+                app.read_feeds();
                 if list_state.selected().is_none() {
                     list_state.select(Some(0));
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('d'),
-                ..
-            }) => {
+            Event::Input(Key::Char('d')) => {
                 if let Some(i) = list_state.selected() {
-                    feeds.remove(i);
-                    write_feeds(&feeds);
+                    app.feeds.remove(i);
+                    app.write_feeds();
 
-                    if feeds.is_empty() {
+                    if app.feeds.is_empty() {
                         list_state.select(None);
-                    } else if i >= feeds.len() {
-                        list_state.select(Some(feeds.len() - 1));
+                    } else if i >= app.feeds.len() {
+                        list_state.select(Some(app.feeds.len() - 1));
                     }
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('q'),
-                ..
-            }) => break,
+            Event::Input(Key::Char('q')) => break,
+            Event::Tick => app.update_on_tick(),
             _ => {}
         }
     }
