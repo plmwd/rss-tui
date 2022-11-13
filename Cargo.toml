@@ -14,3 +14,4 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.5.9"
 serde = { version = "1.0", features = ["derive"] }
 chrono = "0.4.22"
+enum_dispatch = "0.3.8"
